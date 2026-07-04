@@ -1,0 +1,6 @@
+<svg width="1200" height="630" viewBox="0 0 1200 630" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1200" height="630" fill="#111827"/>
+  <rect x="64" y="64" width="1072" height="502" rx="24" fill="#F97316"/>
+  <path d="M268 408V222h84c43 0 72 24 72 60 0 37-29 61-72 61h-38v65h-46Zm46-102h35c19 0 30-9 30-24 0-14-11-23-30-23h-35v47Zm147 102V222h48v148h92v38h-140Zm170 0 72-186h55l72 186h-51l-13-38h-72l-13 38h-50Zm75-73h48l-24-70-24 70Zm158 73V222h47v186h-47Z" fill="#111827"/>
+  <text x="600" y="500" text-anchor="middle" font-family="Arial, sans-serif" font-size="42" font-weight="700" fill="#111827">ScriptSpark</text>
+</svg>
