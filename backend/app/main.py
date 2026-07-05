@@ -22,9 +22,11 @@ SERVICE_NAME = "scriptspark-api"
 STREAM_AUDIO_MEDIA_TYPE = "audio/mpeg"
 STREAM_CHUNK_SIZE = 64 * 1024
 CORS_ALLOWED_ORIGINS = [
-    # Local Vite dev server.
+    # Local development
     "http://localhost:5173",
-    # Production Vercel frontend.
+
+    # Production Vercel domains
+    "https://script-spark-ai.vercel.app",
     "https://script-spark-4sn7oisgr-mokshith2.vercel.app",
 ]
 
