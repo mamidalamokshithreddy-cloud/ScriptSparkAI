@@ -21,6 +21,12 @@ API_PREFIX = "/api"
 SERVICE_NAME = "scriptspark-api"
 STREAM_AUDIO_MEDIA_TYPE = "audio/mpeg"
 STREAM_CHUNK_SIZE = 64 * 1024
+CORS_ALLOWED_ORIGINS = [
+    # Local Vite dev server.
+    "http://localhost:5173",
+    # Production Vercel frontend.
+    "https://script-spark-4sn7oisgr-mokshith2.vercel.app",
+]
 
 
 app = FastAPI(
@@ -33,7 +39,8 @@ app.add_middleware(RequestTracingMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
+    # Use an explicit allowlist so production never falls back to a wildcard origin.
+    allow_origins=CORS_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

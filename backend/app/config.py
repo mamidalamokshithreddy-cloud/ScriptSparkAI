@@ -11,7 +11,10 @@ if load_dotenv:
     load_dotenv()
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
-DEFAULT_ALLOWED_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000"
+DEFAULT_ALLOWED_ORIGINS = (
+    "http://localhost:5173,"
+    "https://script-spark-4sn7oisgr-mokshith2.vercel.app"
+)
 
 
 def _get_optional_str(name: str) -> Optional[str]:
