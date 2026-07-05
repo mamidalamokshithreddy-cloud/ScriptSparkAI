@@ -1,4 +1,4 @@
-const BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000/api").replace(/\/$/, "");
+import { API_BASE_URL } from "@/config/api";
 
 export interface Scene {
   dialogue?: string | unknown[];
@@ -56,7 +56,7 @@ export interface StoryResponse {
 }
 
 export const generateStory = async (payload: any): Promise<StoryResponse> => {
-  const res = await fetch(`${BASE_URL}/story/generate`, {
+  const res = await fetch(`${API_BASE_URL}/api/story/generate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -75,7 +75,7 @@ export const generateVoiceover = async (
   voice = "bella",
   language = "English"
 ): Promise<Blob> => {
-  const res = await fetch(`${BASE_URL}/story/voiceover`, {
+  const res = await fetch(`${API_BASE_URL}/api/story/voiceover`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text, voice, language }),

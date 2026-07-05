@@ -8,4 +8,5 @@ Copy-Item .env.example .env
 npm run dev
 ```
 
-Set `VITE_API_BASE_URL` to your backend API URL, including `/api`, when deployed.
+Set `VITE_API_URL` to your backend root URL when deployed. Do not include `/api`;
+the frontend adds endpoint paths itself.
