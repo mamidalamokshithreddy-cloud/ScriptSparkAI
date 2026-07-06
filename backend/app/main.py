@@ -9,10 +9,10 @@ from app.config import settings
 from app.models.prompt import StoryPrompt
 from app.models.media import VoiceoverRequest
 from app.services.poster_generator import generate_poster
-from app.services.story_generator import generate_story
+from app.services.story_generator import StoryGenerationServiceError, generate_story
 from app.services.voiceover_service import generate_voiceover
 from app.utils.logging import configure_logging, get_logger
-from app.utils.tracing import RequestTracingMiddleware
+from app.utils.tracing import RequestTracingMiddleware, current_request_id
 
 configure_logging()
 logger = get_logger(__name__)
@@ -50,8 +50,13 @@ app.add_middleware(
 
 
 def _service_unavailable(exc: RuntimeError) -> HTTPException:
-    logger.warning("Request failed: %s", exc)
+    logger.warning("request_id=%s Request failed: %s", current_request_id(), exc)
     return HTTPException(status_code=503, detail=str(exc))
+
+
+def _story_service_unavailable(exc: StoryGenerationServiceError) -> HTTPException:
+    logger.exception("request_id=%s Story generation dependency failed", exc.request_id)
+    return HTTPException(status_code=503, detail=exc.to_detail())
 
 
 def _stream_bytes(data: bytes, chunk_size: int = STREAM_CHUNK_SIZE):
@@ -82,6 +87,8 @@ async def story_status() -> dict[str, Any]:
 async def story_generation(prompt: StoryPrompt) -> dict[str, Any]:
     try:
         return generate_story(prompt)
+    except StoryGenerationServiceError as exc:
+        raise _story_service_unavailable(exc) from exc
     except RuntimeError as exc:
         raise _service_unavailable(exc) from exc
 

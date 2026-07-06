@@ -1,9 +1,11 @@
 # === FILE: backend/app/services/story_generator.py ===
 import hashlib
+import importlib
 import json
+import os
 import time
 from functools import lru_cache
-from typing import Any, Optional
+from typing import Any, Callable, Optional, TypeVar
 
 import requests
 
@@ -47,6 +49,106 @@ SCENE_FIELD_NAMES = [
 ]
 VOICEOVER_MAX_WORDS = 140
 TRANSIENT_STATUS_CODES = {408, 500, 502, 503, 504}
+GEMINI_REQUIRED_ENV_VARS = [
+    "GOOGLE_API_KEY",
+    "GEMINI_MODEL",
+    "GEMINI_REQUEST_TIMEOUT_SECONDS",
+    "GEMINI_MAX_OUTPUT_TOKENS",
+    "GEMINI_RETRY_ATTEMPTS",
+    "GEMINI_RETRY_BACKOFF_SECONDS",
+]
+T = TypeVar("T")
+
+
+class StoryGenerationServiceError(RuntimeError):
+    def __init__(self, message: str, request_id: Optional[str] = None, dependency: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.request_id = request_id
+        self.dependency = dependency
+
+    def to_detail(self) -> dict[str, Any]:
+        return {
+            "error": "story_generation_unavailable",
+            "message": str(self),
+            "request_id": self.request_id,
+            "dependency": self.dependency,
+        }
+
+
+def _run_generation_step(step_name: str, dependency: str, action: Callable[[], T]) -> T:
+    request_id = current_request_id()
+    logger.info("request_id=%s generate_story step=%s status=start", request_id, step_name)
+    try:
+        result = action()
+    except StoryGenerationServiceError:
+        logger.exception("request_id=%s generate_story step=%s dependency=%s status=failed", request_id, step_name, dependency)
+        raise
+    except Exception as exc:
+        logger.exception("request_id=%s generate_story step=%s dependency=%s status=failed", request_id, step_name, dependency)
+        raise StoryGenerationServiceError(str(exc), request_id=request_id, dependency=dependency) from exc
+    logger.info("request_id=%s generate_story step=%s status=complete", request_id, step_name)
+    return result
+
+
+def _validate_generation_settings() -> None:
+    dependency_modules = [
+        "app.chains.story_chain",
+        "app.services.rag_service",
+        "app.utils.http",
+        "app.utils.cache",
+        "app.utils.formatter",
+        "requests",
+    ]
+    for module_name in dependency_modules:
+        try:
+            importlib.import_module(module_name)
+        except Exception as exc:
+            logger.exception(
+                "request_id=%s dependency import verification failed module=%s",
+                current_request_id(),
+                module_name,
+            )
+            raise StoryGenerationServiceError(
+                f"Story generation dependency could not be imported: {module_name}",
+                request_id=current_request_id(),
+                dependency=module_name,
+            ) from exc
+    logger.info(
+        "request_id=%s dependency import verification complete modules=%s gemini_client=requests.Session",
+        current_request_id(),
+        dependency_modules,
+    )
+
+    if not settings.ENABLE_AI_GENERATION:
+        return
+
+    missing_env_vars = [name for name in GEMINI_REQUIRED_ENV_VARS if not os.getenv(name)]
+    invalid_settings: list[str] = []
+    if not settings.GOOGLE_API_KEY:
+        invalid_settings.append("GOOGLE_API_KEY")
+    if not settings.GEMINI_MODEL:
+        invalid_settings.append("GEMINI_MODEL")
+    if settings.GEMINI_REQUEST_TIMEOUT_SECONDS <= 0:
+        invalid_settings.append("GEMINI_REQUEST_TIMEOUT_SECONDS")
+    if settings.GEMINI_MAX_OUTPUT_TOKENS <= 0:
+        invalid_settings.append("GEMINI_MAX_OUTPUT_TOKENS")
+    if settings.GEMINI_RETRY_ATTEMPTS <= 0:
+        invalid_settings.append("GEMINI_RETRY_ATTEMPTS")
+    if settings.GEMINI_RETRY_BACKOFF_SECONDS < 0:
+        invalid_settings.append("GEMINI_RETRY_BACKOFF_SECONDS")
+
+    if missing_env_vars or invalid_settings:
+        logger.error(
+            "request_id=%s Gemini settings validation failed missing_env_vars=%s invalid_settings=%s",
+            current_request_id(),
+            missing_env_vars,
+            invalid_settings,
+        )
+        raise StoryGenerationServiceError(
+            "Gemini configuration is incomplete.",
+            request_id=current_request_id(),
+            dependency="Gemini client",
+        )
 
 
 def _local_story_fallback(prompt: StoryPrompt, reason: str) -> dict[str, Any]:
@@ -680,7 +782,12 @@ def _call_gemini(writer_prompt: str) -> str:
 
         if response.status_code == 429:
             _set_quota_cooldown()
-            logger.warning("Gemini quota exhausted for model %s: %s", settings.GEMINI_MODEL, compact_error_text(response))
+            logger.warning(
+                "request_id=%s Gemini quota exhausted for model %s: %s",
+                current_request_id(),
+                settings.GEMINI_MODEL,
+                compact_error_text(response),
+            )
             raise RuntimeError("Gemini quota exhausted. Check API plan/billing or retry later.")
 
         if response.status_code in TRANSIENT_STATUS_CODES and attempt < settings.GEMINI_RETRY_ATTEMPTS:
@@ -695,10 +802,24 @@ def _call_gemini(writer_prompt: str) -> str:
             continue
 
         if response.status_code >= 400:
-            logger.warning("Gemini API error for model %s: %s", settings.GEMINI_MODEL, compact_error_text(response))
+            logger.warning(
+                "request_id=%s Gemini API error for model %s: %s",
+                current_request_id(),
+                settings.GEMINI_MODEL,
+                compact_error_text(response),
+            )
             raise RuntimeError(f"Gemini API error: HTTP {response.status_code}.")
 
-        return _extract_gemini_text(parse_json_response(response, "Gemini"))
+        try:
+            parsed_response = parse_json_response(response, "Gemini")
+            return _extract_gemini_text(parsed_response)
+        except Exception:
+            logger.exception(
+                "request_id=%s Gemini invalid response raw_body=%s",
+                current_request_id(),
+                compact_error_text(response, limit=4000),
+            )
+            raise
 
     if last_error is not None:
         raise last_error
@@ -707,41 +828,104 @@ def _call_gemini(writer_prompt: str) -> str:
 
 def _fallback_or_raise(prompt: StoryPrompt, reason: str) -> dict[str, Any]:
     if settings.ENABLE_LOCAL_STORY_FALLBACK:
+        logger.warning("request_id=%s returning local fallback reason=%s", current_request_id(), reason)
         return _local_story_fallback(prompt, reason)
     raise RuntimeError(reason)
 
 
 def generate_story(prompt: StoryPrompt) -> dict[str, Any]:
+    request_id = current_request_id()
+    logger.info(
+        "request_id=%s generate_story step=Request received status=complete prompt_chars=%s genre=%s language=%s rag_requested=%s",
+        request_id,
+        len(prompt.prompt or ""),
+        prompt.genre,
+        prompt.language,
+        prompt.use_real_world_context,
+    )
+
+    _run_generation_step("Validate settings", "settings/Gemini client", _validate_generation_settings)
+
     if not settings.ENABLE_AI_GENERATION:
-        return _local_story_fallback(
-            prompt,
-            "AI generation is disabled locally. Set ENABLE_AI_GENERATION=true after fixing Gemini quota/billing.",
+        return _run_generation_step(
+            "Return response",
+            "local fallback",
+            lambda: _local_story_fallback(
+                prompt,
+                "AI generation is disabled locally. Set ENABLE_AI_GENERATION=true after fixing Gemini quota/billing.",
+            ),
         )
 
-    if not settings.GOOGLE_API_KEY:
-        return _fallback_or_raise(prompt, "GOOGLE_API_KEY is not configured.")
-
-    retry_after = _get_retry_after()
+    retry_after = _run_generation_step("Check Gemini quota cooldown", "app.utils.cache", _get_retry_after)
     if retry_after is not None:
-        return _local_story_fallback(prompt, f"Gemini quota is cooling down. Retry AI generation in about {retry_after} seconds.")
-
-    try:
-        structured_context, context_docs = _build_context(prompt)
-        cache_key = _story_cache_key(prompt, structured_context)
-        if settings.ENABLE_RESPONSE_CACHE:
-            cached_story = _story_response_cache.get(cache_key)
-            if cached_story is not None:
-                cached_copy = json.loads(json.dumps(cached_story, ensure_ascii=False))
-                cached_copy.setdefault("metadata", {})["cache"] = "hit"
-                cached_copy["metadata"]["request_id"] = current_request_id()
-                logger.info("request_id=%s story response cache hit", current_request_id())
-                return cached_copy
-
-        story_text = run_story_chain_as_text(
-            _build_writer_prompt(prompt, structured_context),
-            _call_gemini,
+        return _run_generation_step(
+            "Return response",
+            "local fallback",
+            lambda: _local_story_fallback(
+                prompt,
+                f"Gemini quota is cooling down. Retry AI generation in about {retry_after} seconds.",
+            ),
         )
-        formatted_story = format_story(
+
+    structured_context, context_docs = _run_generation_step(
+        "Build RAG context",
+        "app.services.rag_service",
+        lambda: _build_context(prompt),
+    )
+    cache_key = _run_generation_step(
+        "Build cache key",
+        "app.utils.cache",
+        lambda: _story_cache_key(prompt, structured_context),
+    )
+
+    if settings.ENABLE_RESPONSE_CACHE:
+        cached_story = _run_generation_step(
+            "Read response cache",
+            "app.utils.cache",
+            lambda: _story_response_cache.get(cache_key),
+        )
+        if cached_story is not None:
+            cached_copy = _run_generation_step(
+                "Format story",
+                "app.utils.formatter",
+                lambda: json.loads(json.dumps(cached_story, ensure_ascii=False)),
+            )
+            cached_copy.setdefault("metadata", {})["cache"] = "hit"
+            cached_copy["metadata"]["request_id"] = current_request_id()
+            logger.info("request_id=%s story response cache hit", current_request_id())
+            return _run_generation_step("Return response", "FastAPI response", lambda: cached_copy)
+
+    writer_prompt = _run_generation_step(
+        "Build prompt",
+        "prompt builder",
+        lambda: _build_writer_prompt(prompt, structured_context),
+    )
+    raw_story_text = _run_generation_step(
+        "Call Gemini",
+        "Gemini client",
+        lambda: _call_gemini(writer_prompt),
+    )
+
+    def _parse_raw_story_text() -> str:
+        try:
+            return run_story_chain_as_text(raw_story_text, lambda text: text)
+        except Exception:
+            logger.exception(
+                "request_id=%s Parse Gemini response failed raw_response=%s",
+                current_request_id(),
+                raw_story_text[:4000],
+            )
+            raise
+
+    story_text = _run_generation_step(
+        "Parse Gemini response",
+        "app.chains.story_chain",
+        _parse_raw_story_text,
+    )
+    formatted_story = _run_generation_step(
+        "Format story",
+        "app.utils.formatter",
+        lambda: format_story(
             story_text,
             prompt.language,
             metadata={
@@ -756,22 +940,17 @@ def generate_story(prompt: StoryPrompt) -> dict[str, Any]:
                     "chunks": context_docs,
                 },
             },
+        ),
+    )
+    completed_story = _run_generation_step(
+        "Complete story design fields",
+        "formatter",
+        lambda: _complete_story_design_fields(formatted_story),
+    )
+    if settings.ENABLE_RESPONSE_CACHE:
+        _run_generation_step(
+            "Write response cache",
+            "app.utils.cache",
+            lambda: _story_response_cache.set(cache_key, completed_story),
         )
-        completed_story = _complete_story_design_fields(formatted_story)
-        if settings.ENABLE_RESPONSE_CACHE:
-            _story_response_cache.set(cache_key, completed_story)
-        return completed_story
-    except (ValueError, json.JSONDecodeError) as exc:
-        logger.warning("Unexpected Gemini response shape: %s", exc)
-        return _fallback_or_raise(prompt, "Unexpected Gemini response shape.")
-    except RuntimeError as exc:
-        return _fallback_or_raise(prompt, str(exc))
-    except requests.Timeout as exc:
-        logger.warning("Gemini request timed out after %s seconds", settings.GEMINI_REQUEST_TIMEOUT_SECONDS)
-        return _fallback_or_raise(prompt, "Gemini request timed out. Check network or retry later.")
-    except requests.RequestException as exc:
-        logger.warning("Gemini network error while calling model %s: %s", settings.GEMINI_MODEL, exc.__class__.__name__)
-        return _fallback_or_raise(prompt, "Gemini network error. Check internet/API access.")
-    except Exception as exc:
-        logger.exception("Unexpected story generation error")
-        return _fallback_or_raise(prompt, "Unexpected AI generation error.")
+    return _run_generation_step("Return response", "FastAPI response", lambda: completed_story)
