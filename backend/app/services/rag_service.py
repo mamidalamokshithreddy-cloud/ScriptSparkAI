@@ -13,6 +13,7 @@ from typing import Any, Optional
 from app.config import settings
 from app.utils.cache import TTLCache
 from app.utils.logging import get_logger
+from app.utils.tracing import current_request_id
 
 logger = get_logger(__name__)
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -100,7 +101,13 @@ def _cached_query_vector(query: str, embedding_model: str) -> tuple[float, ...]:
     assets = _load_rag_assets()
     if assets is None:
         return ()
-    vector = assets.model.encode([query])[0]
+    logger.info("request_id=%s START SentenceTransformer.encode query_length=%s", current_request_id(), len(query))
+    try:
+        vector = assets.model.encode([query])[0]
+    except Exception:
+        logger.exception("request_id=%s SentenceTransformer.encode failed", current_request_id())
+        return ()
+    logger.info("request_id=%s END SentenceTransformer.encode vector_length=%s", current_request_id(), len(vector))
     return tuple(float(value) for value in vector)
 
 
@@ -128,8 +135,13 @@ def _normalize_document(raw_doc: Any, index: int) -> Optional[RagDocument]:
 
 
 def _load_documents(docs_path: Path) -> list[RagDocument]:
-    with docs_path.open("r", encoding="utf-8") as file:
-        raw_documents = json.load(file)
+    logger.info("request_id=%s START load RAG documents path=%s", current_request_id(), docs_path)
+    try:
+        with docs_path.open("r", encoding="utf-8") as file:
+            raw_documents = json.load(file)
+    except Exception:
+        logger.exception("request_id=%s RAG docs JSON load failed path=%s", current_request_id(), docs_path)
+        return []
 
     if not isinstance(raw_documents, list):
         logger.warning("RAG docs file must contain a list of documents: %s", docs_path)
@@ -140,12 +152,13 @@ def _load_documents(docs_path: Path) -> list[RagDocument]:
         for index, raw_document in enumerate(raw_documents)
         if (document := _normalize_document(raw_document, index)) is not None
     ]
-    logger.info("Loaded %s RAG documents from %s", len(documents), docs_path)
+    logger.info("request_id=%s END load RAG documents count=%s path=%s", current_request_id(), len(documents), docs_path)
     return documents
 
 
 @lru_cache(maxsize=1)
 def _load_rag_assets() -> Optional[RagAssets]:
+    logger.info("request_id=%s START load RAG assets enabled=%s", current_request_id(), settings.ENABLE_RAG)
     if not settings.ENABLE_RAG:
         logger.info("RAG disabled. Set ENABLE_RAG=true to load FAISS retrieval.")
         return None
@@ -177,9 +190,16 @@ def _load_rag_assets() -> Optional[RagAssets]:
 
         model = SentenceTransformer(settings.RAG_EMBEDDING_MODEL)
         index = faiss.read_index(str(index_path))
+        logger.info(
+            "request_id=%s END load RAG assets docs=%s index_path=%s embedding_model=%s",
+            current_request_id(),
+            len(documents),
+            index_path,
+            settings.RAG_EMBEDDING_MODEL,
+        )
         return RagAssets(model=model, index=index, documents=documents, np=np)
-    except Exception as exc:
-        logger.warning("RAG disabled because assets or dependencies failed to load: %s", exc)
+    except Exception:
+        logger.exception("request_id=%s RAG disabled because assets or dependencies failed to load", current_request_id())
         return None
 
 
@@ -236,13 +256,23 @@ def _rank_candidate(query: str, document: RagDocument, distance: float) -> Retri
 
 
 def _search_candidates(query: str, assets: RagAssets, candidate_k: int) -> list[RetrievalCandidate]:
+    logger.info(
+        "request_id=%s START FAISS.search query_length=%s candidate_k=%s",
+        current_request_id(),
+        len(query),
+        candidate_k,
+    )
     if not query.strip():
         return []
 
     vector = _cached_query_vector(query, settings.RAG_EMBEDDING_MODEL)
     if not vector:
         return []
-    distances, indices = assets.index.search(assets.np.array([vector]), candidate_k)
+    try:
+        distances, indices = assets.index.search(assets.np.array([vector]), candidate_k)
+    except Exception:
+        logger.exception("request_id=%s FAISS.search failed", current_request_id())
+        return []
 
     candidates: list[RetrievalCandidate] = []
     for raw_distance, raw_index in zip(distances[0], indices[0]):
@@ -250,6 +280,7 @@ def _search_candidates(query: str, assets: RagAssets, candidate_k: int) -> list[
         if doc_index < 0 or doc_index >= len(assets.documents):
             continue
         candidates.append(_rank_candidate(query, assets.documents[doc_index], float(raw_distance)))
+    logger.info("request_id=%s END FAISS.search candidates=%s", current_request_id(), len(candidates))
     return candidates
 
 
@@ -264,62 +295,86 @@ def _deduplicate_candidates(candidates: list[RetrievalCandidate]) -> list[Retrie
 
 
 def retrieve_ranked_context(query: str, k: Optional[int] = None) -> list[dict[str, Any]]:
+    logger.info("request_id=%s START retrieve_ranked_context query_length=%s", current_request_id(), len(query or ""))
     assets = _load_rag_assets()
     if assets is None:
+        logger.info("request_id=%s END retrieve_ranked_context chunks=0 reason=no_assets", current_request_id())
         return []
 
     candidate_k = max(settings.RAG_CANDIDATE_K, settings.RAG_TOP_K, k or 0)
     final_k = k or settings.RAG_TOP_K
     cache_key = f"{query.strip().lower()}::{candidate_k}::{final_k}::{settings.RAG_MIN_SIMILARITY}"
-    cached = _retrieval_cache.get(cache_key)
+    try:
+        cached = _retrieval_cache.get(cache_key)
+    except Exception:
+        logger.exception("request_id=%s RAG cache read failed", current_request_id())
+        cached = None
     if cached is not None:
         logger.info("RAG cache hit for query length %s", len(query))
         return cached
 
-    from app.chains.retrieval_chain import run_retrieval_chain
+    try:
+        logger.info("request_id=%s START run_retrieval_chain", current_request_id())
+        from app.chains.retrieval_chain import run_retrieval_chain
 
-    results = run_retrieval_chain(
-        query=query,
-        assets=assets,
-        candidate_k=candidate_k,
-        top_k=final_k,
-        min_similarity=settings.RAG_MIN_SIMILARITY,
-    )
+        results = run_retrieval_chain(
+            query=query,
+            assets=assets,
+            candidate_k=candidate_k,
+            top_k=final_k,
+            min_similarity=settings.RAG_MIN_SIMILARITY,
+        )
+        logger.info("request_id=%s END run_retrieval_chain chunks=%s", current_request_id(), len(results))
+    except Exception:
+        logger.exception("request_id=%s RAG retrieval chain failed", current_request_id())
+        return []
 
-    _retrieval_cache.set(cache_key, results)
+    try:
+        _retrieval_cache.set(cache_key, results)
+    except Exception:
+        logger.exception("request_id=%s RAG cache write failed", current_request_id())
     logger.info("RAG retrieved %s context chunks for query length %s", len(results), len(query))
+    logger.info("request_id=%s END retrieve_ranked_context chunks=%s", current_request_id(), len(results))
     return results
 
 
 def build_structured_context(chunks: list[dict[str, Any]], max_chars: Optional[int] = None) -> str:
+    logger.info("request_id=%s START build_structured_context chunks=%s", current_request_id(), len(chunks or []))
     if not chunks:
+        logger.info("request_id=%s END build_structured_context chars=0", current_request_id())
         return ""
 
-    budget = max_chars or settings.RAG_MAX_CONTEXT_CHARS
-    blocks: list[str] = []
-    total_chars = 0
+    try:
+        budget = max_chars or settings.RAG_MAX_CONTEXT_CHARS
+        blocks: list[str] = []
+        total_chars = 0
 
-    for chunk in chunks:
-        metadata = chunk.get("metadata") or {}
-        metadata_text = ", ".join(f"{key}={value}" for key, value in metadata.items()) or "none"
-        retrieval = chunk.get("retrieval") or {}
-        block = (
-            f"[{chunk.get('source_id')}] rank={chunk.get('rank')} score={retrieval.get('rank_score')}\n"
-            f"Title: {chunk.get('title')}\n"
-            f"Metadata: {metadata_text}\n"
-            f"Content: {chunk.get('content')}"
-        ).strip()
+        for chunk in chunks:
+            metadata = chunk.get("metadata") or {}
+            metadata_text = ", ".join(f"{key}={value}" for key, value in metadata.items()) or "none"
+            retrieval = chunk.get("retrieval") or {}
+            block = (
+                f"[{chunk.get('source_id')}] rank={chunk.get('rank')} score={retrieval.get('rank_score')}\n"
+                f"Title: {chunk.get('title')}\n"
+                f"Metadata: {metadata_text}\n"
+                f"Content: {chunk.get('content')}"
+            ).strip()
 
-        if total_chars + len(block) > budget:
-            remaining = max(0, budget - total_chars)
-            if remaining > 120:
-                blocks.append(block[:remaining].rstrip())
-            break
+            if total_chars + len(block) > budget:
+                remaining = max(0, budget - total_chars)
+                if remaining > 120:
+                    blocks.append(block[:remaining].rstrip())
+                break
 
-        blocks.append(block)
-        total_chars += len(block)
+            blocks.append(block)
+            total_chars += len(block)
 
-    return "\n\n---\n\n".join(blocks)
+        structured_context = "\n\n---\n\n".join(blocks)
+        logger.info("request_id=%s END build_structured_context chars=%s", current_request_id(), len(structured_context))
+        return structured_context
+    except Exception:
+        logger.exception("request_id=%s build_structured_context failed", current_request_id())
+        return ""
 
 
 def retrieve_context(query: str, k: int = 5) -> list[dict[str, Any]]:

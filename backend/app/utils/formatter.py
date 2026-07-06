@@ -4,6 +4,7 @@ import re
 from typing import Any, Optional
 
 from app.utils.logging import get_logger
+from app.utils.tracing import current_request_id
 
 logger = get_logger(__name__)
 
@@ -49,10 +50,14 @@ def _extract_json_block(text: str) -> str:
 
 
 def _loads_json(value: str) -> Any:
-    parsed = json.loads(value)
-    if isinstance(parsed, str):
-        return json.loads(parsed)
-    return parsed
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, str):
+            return json.loads(parsed)
+        return parsed
+    except json.JSONDecodeError:
+        logger.exception("request_id=%s formatter json.loads failed", current_request_id())
+        raise
 
 
 def _parse_story_json(story_text: str) -> dict[str, Any]:
@@ -236,18 +241,34 @@ def format_story(
     language: str = "English",
     metadata: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
+    logger.info(
+        "request_id=%s START format_story story_chars=%s language=%s",
+        current_request_id(),
+        len(story_text or ""),
+        language,
+    )
     if not story_text:
-        return {
+        formatted = {
             "title": "Untitled",
             "language": language,
             "scenes": [],
             "metadata": metadata or {},
             **TOP_LEVEL_DEFAULTS,
-    }
+        }
+        logger.info("request_id=%s END format_story scenes=0 source=empty", current_request_id())
+        return formatted
 
     try:
         parsed = _parse_story_json(story_text)
         normalized_scenes = _normalize_json_scenes(parsed.get("scenes"))
+        logger.info(
+            "request_id=%s format_story parsed scenes_raw_type=%s normalized_scenes=%s has_voiceover=%s has_poster_prompt=%s",
+            current_request_id(),
+            type(parsed.get("scenes")).__name__,
+            len(normalized_scenes),
+            isinstance(parsed.get("voiceover"), dict),
+            bool(parsed.get("poster_prompt")),
+        )
 
         if normalized_scenes:
             normalized_scenes = _complete_scene_design_fields(normalized_scenes, parsed)
@@ -255,7 +276,7 @@ def format_story(
             merged_metadata = parsed.get("metadata") if isinstance(parsed.get("metadata"), dict) else {}
             merged_metadata = {**merged_metadata, **(metadata or {})}
             voiceover = _normalize_voiceover(parsed, normalized_scenes)
-            return {
+            formatted = {
                 "title": parsed.get("title") or f"Generated Story ({language})",
                 "genre": parsed.get("genre") or TOP_LEVEL_DEFAULTS["genre"],
                 "language": parsed.get("language") or language,
@@ -284,18 +305,25 @@ def format_story(
                 "color_palette": parsed.get("color_palette") or TOP_LEVEL_DEFAULTS["color_palette"],
                 "metadata": merged_metadata,
             }
+            logger.info(
+                "request_id=%s END format_story scenes=%s source=structured metadata_keys=%s",
+                current_request_id(),
+                len(normalized_scenes),
+                list(formatted["metadata"].keys()),
+            )
+            return formatted
 
         raise ValueError("Story JSON did not contain usable scenes.")
     except ValueError as exc:
         if story_text.lstrip().startswith("{") or "```json" in story_text.lower():
-            logger.warning("Invalid structured story response: %s", exc)
+            logger.exception("request_id=%s Invalid structured story response", current_request_id())
             raise
     except TypeError:
-        logger.warning("Invalid story response type", exc_info=True)
+        logger.exception("request_id=%s Invalid story response type", current_request_id())
         raise ValueError("Story response type was invalid.")
 
     scenes = _format_plain_text(story_text)
-    return {
+    formatted = {
         "title": f"Generated Story ({language})",
         "genre": TOP_LEVEL_DEFAULTS["genre"],
         "language": language,
@@ -328,3 +356,5 @@ def format_story(
         "color_palette": TOP_LEVEL_DEFAULTS["color_palette"],
         "metadata": metadata or {},
     }
+    logger.info("request_id=%s END format_story scenes=%s source=plain_text", current_request_id(), len(scenes))
+    return formatted

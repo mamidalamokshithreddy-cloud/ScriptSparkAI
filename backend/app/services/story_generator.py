@@ -352,10 +352,38 @@ def _set_quota_cooldown() -> None:
 
 
 def _build_context(prompt: StoryPrompt) -> tuple[str, list[dict[str, Any]]]:
+    logger.info(
+        "request_id=%s START _build_context rag_requested=%s rag_enabled=%s",
+        current_request_id(),
+        prompt.use_real_world_context,
+        settings.ENABLE_RAG,
+    )
     if not prompt.use_real_world_context:
+        logger.info("request_id=%s END _build_context chars=0 chunks=0 reason=disabled_by_request", current_request_id())
         return "", []
-    context_docs = retrieve_ranked_context(prompt.prompt)
-    return build_structured_context(context_docs), context_docs
+    try:
+        logger.info("request_id=%s START retrieve_ranked_context", current_request_id())
+        context_docs = retrieve_ranked_context(prompt.prompt)
+        logger.info("request_id=%s END retrieve_ranked_context chunks=%s", current_request_id(), len(context_docs))
+    except Exception:
+        logger.exception("request_id=%s retrieve_ranked_context failed; continuing without RAG", current_request_id())
+        return "", []
+
+    try:
+        logger.info("request_id=%s START build_structured_context", current_request_id())
+        structured_context = build_structured_context(context_docs)
+        logger.info("request_id=%s END build_structured_context chars=%s", current_request_id(), len(structured_context))
+    except Exception:
+        logger.exception("request_id=%s build_structured_context failed; continuing without RAG", current_request_id())
+        return "", []
+
+    logger.info(
+        "request_id=%s END _build_context chars=%s chunks=%s",
+        current_request_id(),
+        len(structured_context),
+        len(context_docs),
+    )
+    return structured_context, context_docs
 
 
 def _scene_count(length_minutes: Optional[int]) -> int:
@@ -470,7 +498,13 @@ Return only valid JSON with this exact shape:
 
 
 def _build_writer_prompt(prompt: StoryPrompt, context: str) -> str:
-    return _build_writer_prompt_cached(
+    logger.info(
+        "request_id=%s START _build_writer_prompt prompt_chars=%s context_chars=%s",
+        current_request_id(),
+        len(prompt.prompt or ""),
+        len(context or ""),
+    )
+    writer_prompt = _build_writer_prompt_cached(
         prompt_text=prompt.prompt.strip(),
         genre=prompt.genre or "Drama",
         length_minutes=int(prompt.length_minutes or 5),
@@ -478,6 +512,8 @@ def _build_writer_prompt(prompt: StoryPrompt, context: str) -> str:
         themes_key=_themes_key(prompt.themes),
         context=context,
     )
+    logger.info("request_id=%s END _build_writer_prompt chars=%s", current_request_id(), len(writer_prompt))
+    return writer_prompt
 
 
 def _build_gemini_payload(writer_prompt: str) -> dict[str, Any]:
@@ -573,6 +609,14 @@ def _call_gemini(writer_prompt: str) -> str:
     url = GEMINI_API_URL_TEMPLATE.format(model=settings.GEMINI_MODEL)
     payload = _build_gemini_payload(writer_prompt)
     last_error: Optional[requests.RequestException] = None
+    payload_size = len(json.dumps(payload, ensure_ascii=False))
+    logger.info(
+        "request_id=%s START _call_gemini model=%s timeout=%s payload_bytes=%s",
+        current_request_id(),
+        settings.GEMINI_MODEL,
+        settings.GEMINI_REQUEST_TIMEOUT_SECONDS,
+        payload_size,
+    )
 
     for attempt in range(1, settings.GEMINI_RETRY_ATTEMPTS + 1):
         try:
@@ -666,7 +710,9 @@ def _call_gemini(writer_prompt: str) -> str:
 
         try:
             parsed_response = parse_json_response(response, "Gemini")
-            return _extract_gemini_text(parsed_response)
+            story_text = _extract_gemini_text(parsed_response)
+            logger.info("request_id=%s END _call_gemini text_chars=%s", current_request_id(), len(story_text))
+            return story_text
         except Exception as exc:
             logger.exception(
                 "request_id=%s Gemini invalid response raw_body=%s",
@@ -696,7 +742,7 @@ def _fallback_or_raise(prompt: StoryPrompt, reason: str) -> dict[str, Any]:
     if settings.ENABLE_LOCAL_STORY_FALLBACK:
         logger.warning("request_id=%s returning local fallback reason=%s", current_request_id(), reason)
         return _local_story_fallback(prompt, reason)
-    raise RuntimeError(reason)
+    raise StoryGenerationServiceError(reason, request_id=current_request_id(), dependency="story generation")
 
 
 def generate_story(prompt: StoryPrompt) -> dict[str, Any]:
@@ -745,11 +791,13 @@ def generate_story(prompt: StoryPrompt) -> dict[str, Any]:
     )
 
     if settings.ENABLE_RESPONSE_CACHE:
-        cached_story = _run_generation_step(
-            "Read response cache",
-            "app.utils.cache",
-            lambda: _story_response_cache.get(cache_key),
-        )
+        logger.info("request_id=%s START response cache read", current_request_id())
+        try:
+            cached_story = _story_response_cache.get(cache_key)
+        except Exception:
+            logger.exception("request_id=%s response cache read failed; continuing without cache", current_request_id())
+            cached_story = None
+        logger.info("request_id=%s END response cache read hit=%s", current_request_id(), cached_story is not None)
         if cached_story is not None:
             cached_copy = _run_generation_step(
                 "Format story",
@@ -826,9 +874,10 @@ def generate_story(prompt: StoryPrompt) -> dict[str, Any]:
         lambda: _complete_story_design_fields(formatted_story),
     )
     if settings.ENABLE_RESPONSE_CACHE:
-        _run_generation_step(
-            "Write response cache",
-            "app.utils.cache",
-            lambda: _story_response_cache.set(cache_key, completed_story),
-        )
+        logger.info("request_id=%s START response cache write", current_request_id())
+        try:
+            _story_response_cache.set(cache_key, completed_story)
+        except Exception:
+            logger.exception("request_id=%s response cache write failed; continuing", current_request_id())
+        logger.info("request_id=%s END response cache write", current_request_id())
     return _run_generation_step("Return response", "FastAPI response", lambda: completed_story)

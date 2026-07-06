@@ -8,7 +8,11 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.prompt_values import ChatPromptValue
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 
+from app.utils.logging import get_logger
+from app.utils.tracing import current_request_id
+
 ModelCaller = Callable[[str], str]
+logger = get_logger(__name__)
 
 
 def _prompt_value_to_text(prompt_value: ChatPromptValue) -> str:
@@ -27,9 +31,15 @@ def build_story_chain(model_caller: ModelCaller) -> Any:
 
 
 def run_story_chain(writer_prompt: str, model_caller: ModelCaller) -> dict[str, Any]:
-    parsed = build_story_chain(model_caller).invoke(writer_prompt)
+    logger.info("request_id=%s START run_story_chain.invoke prompt_chars=%s", current_request_id(), len(writer_prompt))
+    try:
+        parsed = build_story_chain(model_caller).invoke(writer_prompt)
+    except Exception:
+        logger.exception("request_id=%s run_story_chain.invoke failed", current_request_id())
+        raise
     if not isinstance(parsed, dict):
         raise ValueError("Story LCEL chain returned non-object JSON.")
+    logger.info("request_id=%s END run_story_chain.invoke keys=%s", current_request_id(), list(parsed.keys()))
     return parsed
 
 
