@@ -14,7 +14,7 @@ from app.services.rag_service import build_structured_context, retrieve_ranked_c
 from app.utils.formatter import format_story
 from app.config import settings
 from app.utils.cache import TTLCache
-from app.utils.http import compact_error_text, parse_json_response
+from app.utils.http import parse_json_response
 from app.utils.logging import get_logger
 from app.utils.tracing import current_request_id
 
@@ -59,6 +59,21 @@ GEMINI_REQUIRED_ENV_VARS = [
 T = TypeVar("T")
 
 
+def _raw_response_body(response: requests.Response, limit: int = 4000) -> str:
+    return response.text[:limit]
+
+
+def _log_gemini_response(response: requests.Response, attempt: int) -> None:
+    logger.info(
+        "request_id=%s Gemini HTTP response attempt=%s status=%s headers=%s raw_body=%s",
+        current_request_id(),
+        attempt,
+        response.status_code,
+        dict(response.headers),
+        _raw_response_body(response),
+    )
+
+
 class StoryGenerationServiceError(RuntimeError):
     def __init__(self, message: str, request_id: Optional[str] = None, dependency: Optional[str] = None) -> None:
         super().__init__(message)
@@ -84,7 +99,11 @@ def _run_generation_step(step_name: str, dependency: str, action: Callable[[], T
         raise
     except Exception as exc:
         logger.exception("request_id=%s generate_story step=%s dependency=%s status=failed", request_id, step_name, dependency)
-        raise StoryGenerationServiceError(str(exc), request_id=request_id, dependency=dependency) from exc
+        raise StoryGenerationServiceError(
+            f"{exc.__class__.__name__}: {exc}",
+            request_id=request_id,
+            dependency=dependency,
+        ) from exc
     logger.info("request_id=%s generate_story step=%s status=complete", request_id, step_name)
     return result
 
@@ -476,185 +495,8 @@ def _build_gemini_payload(writer_prompt: str) -> dict[str, Any]:
     return {
         "contents": [{"role": "user", "parts": [{"text": writer_prompt}]}],
         "generationConfig": {
-            "temperature": 0.9,
-            "topP": 0.95,
+            "temperature": 0.8,
             "maxOutputTokens": settings.GEMINI_MAX_OUTPUT_TOKENS,
-            "responseMimeType": "application/json",
-            "responseSchema": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string"},
-                    "genre": {"type": "string"},
-                    "language": {"type": "string"},
-                    "logline": {"type": "string"},
-                    "summary": {"type": "string"},
-                    "characters": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": {"type": "string"},
-                                "role": {"type": "string"},
-                                "arc": {"type": "string"},
-                            },
-                            "required": ["name", "role", "arc"],
-                        },
-                    },
-                    "character_profiles": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": {"type": "string"},
-                                "age_range": {"type": "string"},
-                                "motivation": {"type": "string"},
-                                "conflict": {"type": "string"},
-                                "visual_identity": {"type": "string"},
-                            },
-                            "required": ["name", "age_range", "motivation", "conflict", "visual_identity"],
-                        },
-                    },
-                    "themes": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "tone": {"type": "string"},
-                    "target_audience": {"type": "string"},
-                    "estimated_runtime": {"type": "string"},
-                    "scene_count": {"type": "integer"},
-                    "scenes": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "scene_number": {"type": "integer"},
-                                "location": {"type": "string"},
-                                "time": {"type": "string"},
-                                "characters": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                },
-                                "visual_description": {"type": "string"},
-                                "character_action": {"type": "string"},
-                                "dialogue": {"type": "string"},
-                                "emotional_shift": {"type": "string"},
-                                "camera_suggestion": {"type": "string"},
-                                "lighting": {"type": "string"},
-                                "background_music": {"type": "string"},
-                                "color_palette": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                },
-                                "shot_list": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                },
-                                "production_note": {"type": "string"},
-                            },
-                            "required": ["scene_number", *SCENE_FIELD_NAMES],
-                        },
-                    },
-                    "scene_breakdown": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "scene_number": {"type": "integer"},
-                                "purpose": {"type": "string"},
-                                "conflict": {"type": "string"},
-                                "turning_point": {"type": "string"},
-                            },
-                            "required": ["scene_number", "purpose", "conflict", "turning_point"],
-                        },
-                    },
-                    "dialogues": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "scene_number": {"type": "integer"},
-                                "speaker": {"type": "string"},
-                                "line": {"type": "string"},
-                            },
-                            "required": ["scene_number", "speaker", "line"],
-                        },
-                    },
-                    "voiceover": {
-                        "type": "object",
-                        "properties": {
-                            "style": {"type": "string"},
-                            "sample": {"type": "string"},
-                            "narration_text": {"type": "string"},
-                        },
-                        "required": ["style", "sample", "narration_text"],
-                    },
-                    "screenplay": {"type": "string"},
-                    "poster_prompt": {"type": "string"},
-                    "shot_list": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "camera_suggestions": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "lighting_suggestions": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "background_music_suggestions": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "production_notes": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "background_music": {"type": "string"},
-                    "camera_style": {"type": "string"},
-                    "color_palette": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "metadata": {
-                        "type": "object",
-                        "properties": {
-                            "format": {"type": "string"},
-                            "grounding_note": {"type": "string"},
-                        },
-                        "required": ["format", "grounding_note"],
-                    },
-                },
-                "required": [
-                    "title",
-                    "genre",
-                    "language",
-                    "logline",
-                    "summary",
-                    "characters",
-                    "character_profiles",
-                    "themes",
-                    "tone",
-                    "target_audience",
-                    "estimated_runtime",
-                    "scene_count",
-                    "scenes",
-                    "scene_breakdown",
-                    "dialogues",
-                    "voiceover",
-                    "screenplay",
-                    "poster_prompt",
-                    "shot_list",
-                    "camera_suggestions",
-                    "lighting_suggestions",
-                    "background_music_suggestions",
-                    "production_notes",
-                    "background_music",
-                    "camera_style",
-                    "color_palette",
-                    "metadata",
-                ],
-            },
         },
     }
 
@@ -763,7 +605,11 @@ def _call_gemini(writer_prompt: str) -> str:
             if attempt < settings.GEMINI_RETRY_ATTEMPTS:
                 _sleep_before_retry(attempt)
                 continue
-            raise
+            raise StoryGenerationServiceError(
+                f"Gemini request timed out after {settings.GEMINI_REQUEST_TIMEOUT_SECONDS} seconds.",
+                request_id=current_request_id(),
+                dependency="Gemini client",
+            ) from exc
         except requests.RequestException as exc:
             last_error = exc
             logger.warning(
@@ -776,52 +622,85 @@ def _call_gemini(writer_prompt: str) -> str:
             if attempt < settings.GEMINI_RETRY_ATTEMPTS:
                 _sleep_before_retry(attempt)
                 continue
-            raise
+            raise StoryGenerationServiceError(
+                f"Gemini network error: {exc.__class__.__name__}: {exc}",
+                request_id=current_request_id(),
+                dependency="Gemini client",
+            ) from exc
+
+        _log_gemini_response(response, attempt)
+        response_body = _raw_response_body(response)
 
         if response.status_code == 429:
             _set_quota_cooldown()
             logger.warning(
-                "request_id=%s Gemini quota exhausted for model %s: %s",
+                "request_id=%s Gemini quota exhausted for model %s status=%s headers=%s raw_body=%s",
                 current_request_id(),
                 settings.GEMINI_MODEL,
-                compact_error_text(response),
+                response.status_code,
+                dict(response.headers),
+                response_body,
             )
-            raise RuntimeError("Gemini quota exhausted. Check API plan/billing or retry later.")
+            raise StoryGenerationServiceError(
+                f"Gemini quota exhausted. HTTP {response.status_code}. Response body: {response_body}",
+                request_id=current_request_id(),
+                dependency="Gemini client",
+            )
 
         if response.status_code in TRANSIENT_STATUS_CODES and attempt < settings.GEMINI_RETRY_ATTEMPTS:
             logger.warning(
-                "request_id=%s Gemini transient HTTP %s attempt=%s/%s",
+                "request_id=%s Gemini transient HTTP %s attempt=%s/%s headers=%s raw_body=%s",
                 current_request_id(),
                 response.status_code,
                 attempt,
                 settings.GEMINI_RETRY_ATTEMPTS,
+                dict(response.headers),
+                response_body,
             )
             _sleep_before_retry(attempt)
             continue
 
         if response.status_code >= 400:
             logger.warning(
-                "request_id=%s Gemini API error for model %s: %s",
+                "request_id=%s Gemini API error for model %s status=%s headers=%s raw_body=%s",
                 current_request_id(),
                 settings.GEMINI_MODEL,
-                compact_error_text(response),
+                response.status_code,
+                dict(response.headers),
+                response_body,
             )
-            raise RuntimeError(f"Gemini API error: HTTP {response.status_code}.")
+            raise StoryGenerationServiceError(
+                f"Gemini API error: HTTP {response.status_code}. Response body: {response_body}",
+                request_id=current_request_id(),
+                dependency="Gemini client",
+            )
 
         try:
             parsed_response = parse_json_response(response, "Gemini")
             return _extract_gemini_text(parsed_response)
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "request_id=%s Gemini invalid response raw_body=%s",
                 current_request_id(),
-                compact_error_text(response, limit=4000),
+                response_body,
             )
-            raise
+            raise StoryGenerationServiceError(
+                f"Gemini returned an invalid response. Response body: {response_body}",
+                request_id=current_request_id(),
+                dependency="Gemini client",
+            ) from exc
 
     if last_error is not None:
-        raise last_error
-    raise RuntimeError("Gemini request failed after retries.")
+        raise StoryGenerationServiceError(
+            f"Gemini request failed after retries: {last_error.__class__.__name__}: {last_error}",
+            request_id=current_request_id(),
+            dependency="Gemini client",
+        ) from last_error
+    raise StoryGenerationServiceError(
+        "Gemini request failed after retries.",
+        request_id=current_request_id(),
+        dependency="Gemini client",
+    )
 
 
 def _fallback_or_raise(prompt: StoryPrompt, reason: str) -> dict[str, Any]:
