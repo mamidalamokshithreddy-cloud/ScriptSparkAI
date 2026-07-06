@@ -9,7 +9,6 @@ from typing import Any, Callable, Optional, TypeVar
 
 import requests
 
-from app.chains.story_chain import run_story_chain_as_text
 from app.models.prompt import StoryPrompt
 from app.services.rag_service import build_structured_context, retrieve_ranked_context
 from app.utils.formatter import format_story
@@ -92,7 +91,6 @@ def _run_generation_step(step_name: str, dependency: str, action: Callable[[], T
 
 def _validate_generation_settings() -> None:
     dependency_modules = [
-        "app.chains.story_chain",
         "app.services.rag_service",
         "app.utils.http",
         "app.utils.cache",
@@ -906,22 +904,34 @@ def generate_story(prompt: StoryPrompt) -> dict[str, Any]:
         lambda: _call_gemini(writer_prompt),
     )
 
-    def _parse_raw_story_text() -> str:
-        try:
-            return run_story_chain_as_text(raw_story_text, lambda text: text)
-        except Exception:
-            logger.exception(
-                "request_id=%s Parse Gemini response failed raw_response=%s",
-                current_request_id(),
-                raw_story_text[:4000],
-            )
-            raise
+    logger.info("request_id=%s json.loads Gemini response status=start", current_request_id())
+    try:
+        parsed_story = json.loads(raw_story_text)
+    except json.JSONDecodeError:
+        logger.exception(
+            "request_id=%s Gemini returned invalid JSON raw_response=%s",
+            current_request_id(),
+            raw_story_text[:4000],
+        )
+        return _run_generation_step(
+            "Return response",
+            "local fallback",
+            lambda: _fallback_or_raise(prompt, "Gemini returned invalid JSON."),
+        )
+    except Exception as exc:
+        logger.exception(
+            "request_id=%s Gemini JSON parsing failed raw_response=%s",
+            current_request_id(),
+            raw_story_text[:4000],
+        )
+        raise StoryGenerationServiceError(
+            "Gemini JSON parsing failed.",
+            request_id=current_request_id(),
+            dependency="json.loads",
+        ) from exc
+    logger.info("request_id=%s json.loads Gemini response status=complete", current_request_id())
 
-    story_text = _run_generation_step(
-        "Parse Gemini response",
-        "app.chains.story_chain",
-        _parse_raw_story_text,
-    )
+    story_text = json.dumps(parsed_story, ensure_ascii=False)
     formatted_story = _run_generation_step(
         "Format story",
         "app.utils.formatter",
