@@ -16,6 +16,16 @@ from app.utils.tracing import RequestTracingMiddleware, current_request_id
 
 configure_logging()
 logger = get_logger(__name__)
+logger.info(
+    "Gemini startup settings google_api_key_configured=%s gemini_model=%s gemini_max_output_tokens=%s "
+    "gemini_retry_attempts=%s gemini_retry_backoff_seconds=%s gemini_request_timeout_seconds=%s",
+    bool(settings.GOOGLE_API_KEY),
+    settings.GEMINI_MODEL,
+    settings.GEMINI_MAX_OUTPUT_TOKENS,
+    settings.GEMINI_RETRY_ATTEMPTS,
+    settings.GEMINI_RETRY_BACKOFF_SECONDS,
+    settings.GEMINI_REQUEST_TIMEOUT_SECONDS,
+)
 
 API_PREFIX = "/api"
 SERVICE_NAME = "scriptspark-api"

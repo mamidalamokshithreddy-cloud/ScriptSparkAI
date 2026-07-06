@@ -2,7 +2,6 @@
 import hashlib
 import importlib
 import json
-import os
 import time
 from functools import lru_cache
 from typing import Any, Callable, Optional, TypeVar
@@ -48,14 +47,6 @@ SCENE_FIELD_NAMES = [
 ]
 VOICEOVER_MAX_WORDS = 140
 TRANSIENT_STATUS_CODES = {408, 500, 502, 503, 504}
-GEMINI_REQUIRED_ENV_VARS = [
-    "GOOGLE_API_KEY",
-    "GEMINI_MODEL",
-    "GEMINI_REQUEST_TIMEOUT_SECONDS",
-    "GEMINI_MAX_OUTPUT_TOKENS",
-    "GEMINI_RETRY_ATTEMPTS",
-    "GEMINI_RETRY_BACKOFF_SECONDS",
-]
 T = TypeVar("T")
 
 
@@ -139,7 +130,6 @@ def _validate_generation_settings() -> None:
     if not settings.ENABLE_AI_GENERATION:
         return
 
-    missing_env_vars = [name for name in GEMINI_REQUIRED_ENV_VARS if not os.getenv(name)]
     invalid_settings: list[str] = []
     if not settings.GOOGLE_API_KEY:
         invalid_settings.append("GOOGLE_API_KEY")
@@ -154,15 +144,14 @@ def _validate_generation_settings() -> None:
     if settings.GEMINI_RETRY_BACKOFF_SECONDS < 0:
         invalid_settings.append("GEMINI_RETRY_BACKOFF_SECONDS")
 
-    if missing_env_vars or invalid_settings:
+    if invalid_settings:
         logger.error(
-            "request_id=%s Gemini settings validation failed missing_env_vars=%s invalid_settings=%s",
+            "request_id=%s Gemini settings validation failed invalid_settings=%s",
             current_request_id(),
-            missing_env_vars,
             invalid_settings,
         )
         raise StoryGenerationServiceError(
-            "Gemini configuration is incomplete.",
+            f"Gemini configuration is invalid: {', '.join(invalid_settings)}",
             request_id=current_request_id(),
             dependency="Gemini client",
         )
